@@ -1,5 +1,5 @@
 # ubuntu-checkup
-Ubuntu-checkup is a comprehensive Linux system repair and reporting tool designed to maintain the health of Ubuntu-derived systems. By automating routine maintenance tasks and generating detailed system health reports, it serves as a one-stop solution for keeping your system optimized and secure.
+Ubuntu-checkup is a Linux system repair and reporting tool designed to maintain the health of Ubuntu-derived systems. By automating routine maintenance tasks and generating detailed system health reports, it serves as a one-stop solution for keeping your system optimized and secure.
 
 # Features
 - **System Updates**: Automates the process of updating and upgrading installed packages to ensure your system is up-to-date.
