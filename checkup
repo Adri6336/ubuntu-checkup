@@ -1,0 +1,540 @@
+#!/bin/bash
+set -euo pipefail
+
+# Default Variables
+if [ -n "${SUDO_USER:-}" ]; then
+    USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+else
+    USER_HOME=$HOME
+fi
+
+# Report file naming:
+# Format: system_health_report_MM-YY-DD-{UTC time}.html
+# Example: MM-YY-DD = 12-24-06 for December 2024 06th. 
+# Using %y for two-digit year as requested ("YY"), and UTC time for the time.
+REPORT_TIMESTAMP=$(date -u '+%m-%y-%d-%H%M%SZ')
+REPORT_FILE="${USER_HOME}/system_health_report_${REPORT_TIMESTAMP}.html"
+
+TEMP_DIR="/tmp/system_maintenance"
+SYSLOG_FILE="/var/log/syslog"
+LOG_FILE="/var/log/system_maintenance.log"
+DO_UPDATE=true
+DO_SMART=true
+DO_DEBSUMS=true
+
+print_help() {
+    cat <<EOF
+checkup - A System Health and Maintenance Tool
+
+Usage: checkup [OPTIONS]
+
+This script performs routine system checks, updates, and maintenance tasks on a Linux system.
+It generates an HTML report outlining system health metrics (disk usage, memory usage, CPU load),
+recent error logs, SMART disk status, and package integrity checks.
+
+Options:
+  -n, --no-update       Skip the system update and upgrade steps.
+  -s, --skip-smart      Skip SMART disk checks.
+  -d, --no-debsums      Skip debsums package integrity checks.
+  -l, --log-file FILE   Specify an alternate log file path. Default: /var/log/system_maintenance.log
+  -r, --report-file FILE Specify an alternate report file path. Default: \$USER_HOME/system_health_report_<timestamp>.html
+  -h, --help            Show this help message and exit.
+
+Examples:
+  Run a full system check and generate a report:
+    sudo checkup
+
+  Run checkup but skip SMART checks and system updates:
+    sudo checkup --skip-smart --no-update
+
+EOF
+}
+
+log() {
+    local msg="$1"
+    local timestamp
+    timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+    echo "[$timestamp] $msg" | tee -a "$LOG_FILE"
+}
+
+cleanup() {
+    log "Cleaning up temporary files..."
+    rm -rf "$TEMP_DIR"
+}
+
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        log "This script must be run as root. Please run with sudo."
+        exit 1
+    fi
+}
+
+install_if_missing() {
+    local cmd="$1"
+    local pkg="$2"
+    if ! command -v "$cmd" &> /dev/null; then
+        log "Installing $pkg..."
+        apt-get install -y "$pkg"
+    fi
+}
+
+system_update() {
+    if [ "$DO_UPDATE" = true ]; then
+        # Use a non-interactive, minimal prompt environment
+        DEBIAN_FRONTEND="noninteractive"
+        DEBIAN_PRIORITY="critical"
+        DEBCONF_NOWARNINGS="yes"
+        export DEBIAN_FRONTEND DEBIAN_PRIORITY DEBCONF_NOWARNINGS
+
+        log "Starting system update and upgrade with safer upgrade steps..."
+
+        # Update package lists
+        if ! apt-get update -y; then
+            log "Warning: Failed to update package index lists."
+        fi
+
+        # Attempt to fix any interrupted upgrades
+        if ! dpkg --configure -a; then
+            log "Warning: Failed to fix interrupted upgrades."
+        fi
+
+        # Attempt to fix broken dependencies or missing packages
+        if ! apt-get install --fix-broken --fix-missing -y; then
+            log "Warning: Failed to fix broken or missing dependencies."
+        fi
+
+        # Perform a dist-upgrade to handle updates that add or remove dependencies
+        # Using apt-get instead of apt for better compatibility
+        if ! apt-get dist-upgrade -y --allow-downgrades --fix-broken --fix-missing; then
+            log "Warning: Dist-upgrade encountered issues."
+        else
+            log "System successfully updated and upgraded."
+        fi
+    else
+        log "Skipping system update and upgrade as requested by user."
+    fi
+}
+
+clean_apt_cache() {
+    log "Cleaning up APT cache and unnecessary packages..."
+    apt-get autoremove -y
+    apt-get autoclean -y
+}
+
+check_disk_usage() {
+    log "Checking disk usage..."
+    df -h > "$TEMP_DIR/disk_usage.txt"
+}
+
+check_smart_status() {
+    if [ "$DO_SMART" = true ]; then
+        log "Checking SMART status of disks..."
+        install_if_missing "smartctl" "smartmontools"
+        DISKS=$(smartctl --scan | awk '{print $1}')
+        {
+            for disk in $DISKS; do
+                echo "<h3>SMART status for $disk:</h3>"
+                echo "<pre>"
+                smartctl -H "$disk"
+                echo "</pre>"
+            done
+        } > "$TEMP_DIR/smart_status.html"
+    else
+        log "Skipping SMART disk checks as requested."
+        echo "<p>SMART checks were skipped.</p>" > "$TEMP_DIR/smart_status.html"
+    fi
+}
+
+schedule_filesystem_check() {
+    log "Scheduling filesystem check on next reboot..."
+    touch /forcefsck
+}
+
+check_memory_usage() {
+    log "Checking memory usage..."
+    free -h > "$TEMP_DIR/memory_usage.txt"
+}
+
+check_cpu_load() {
+    log "Checking CPU load..."
+    top -b -n1 | head -n 20 > "$TEMP_DIR/cpu_load.txt"
+}
+
+check_system_logs() {
+    log "Checking system logs for recent errors..."
+    # Force grep to treat file as text and ensure no error stops the script
+    grep -aEi "error|fail|critical" "$SYSLOG_FILE" | tail -n 50 > "$TEMP_DIR/system_errors.txt" || true
+    # Ensure the file exists even if empty
+    [ -f "$TEMP_DIR/system_errors.txt" ] || touch "$TEMP_DIR/system_errors.txt"
+}
+
+check_and_repair_debsums() {
+    if [ "$DO_DEBSUMS" = true ]; then
+        log "Checking package integrity with debsums..."
+        install_if_missing "debsums" "debsums"
+        DEBSUMS_ERRORS="$TEMP_DIR/debsums_errors.txt"
+        debsums -c > "$DEBSUMS_ERRORS" || true
+
+        if [ -s "$DEBSUMS_ERRORS" ]; then
+            log "Found corrupted packages. Attempting to repair..."
+            PACKAGES=$(awk '{print $1}' "$DEBSUMS_ERRORS" | xargs -I{} dpkg -S "{}" 2>/dev/null | cut -d: -f1 | sort -u)
+            if [ -n "$PACKAGES" ]; then
+                log "Packages to reinstall: $PACKAGES"
+                apt-get install --reinstall -y $PACKAGES
+            else
+                log "No packages found to repair."
+            fi
+        else
+            log "No package integrity issues found."
+        fi
+
+        # Convert debsums output to HTML
+        {
+            echo "<pre>"
+            debsums
+            echo "</pre>"
+        } > "$TEMP_DIR/debsums_report.html"
+    else
+        log "Skipping debsums package integrity check as requested."
+        echo "<p>debsums check was skipped.</p>" > "$TEMP_DIR/debsums_report.html"
+    fi
+}
+
+highlight_logs() {
+    # Highlights the words error/fail/critical
+    # Already handled, but now we parse lines and produce a table.
+    local file="$1"
+    if [ ! -s "$file" ]; then
+        echo "<p>No recent errors found.</p>"
+        return
+    fi
+
+    echo "<table class='error-table'>"
+    echo "<tr><th>Timestamp</th><th>Host</th><th>Process</th><th>Message</th><th>Explanation</th></tr>"
+
+    # Each log line looks like:
+    # 2024-12-06T10:51:23.855630-06:00 mhi-001 systemd[1]: Failed to start ...
+    # We'll use a regex to parse:
+    # TIMESTAMP, HOST, PROCESS: MESSAGE
+    grep . "$file" | while IFS= read -r line; do
+        # Extract fields. We'll assume RFC 3339-like timestamps and that fields follow a pattern.
+        # Format: TIMESTAMP HOST PROCESS: MESSAGE
+        # We'll use awk to split by space first and then recombine.
+
+        # First, highlight keywords in the line before parsing:
+        hl_line=$(echo "$line" | sed -e 's/\([Ee][Rr][Rr][Oo][Rr]\)/<span class="critical">\1<\/span>/g' \
+                                     -e 's/\([Ff][Aa][Ii][Ll]\)/<span class="critical">\1<\/span>/g' \
+                                     -e 's/\([Cc][Rr][Ii][Tt][Ii][Cc][Aa][Ll]\)/<span class="critical">\1<\/span>/g')
+
+        # Use awk to separate by spaces:
+        # We'll consider first field as timestamp (with timezone), second as host, then process might contain ":", 
+        # We'll split once we find the first colon that separates process and message.
+        timestamp=$(echo "$hl_line" | awk '{print $1}')
+        local_user_time=$(date -d "$timestamp" '+%d/%m/%Y %I:%M %p' 2>/dev/null)
+        if [ -z "$local_user_time" ]; then
+            local_user_time="$timestamp"
+        fi
+
+        host=$(echo "$hl_line" | awk '{print $2}')
+        
+        # Extract the rest after timestamp and host:
+        rest=$(echo "$hl_line" | cut -d' ' -f3-)
+        # rest should look like "systemd[1]: <message here>"
+        # Separate process from message by first occurrence of ':'
+        process=$(echo "$rest" | sed 's/:.*//')
+        message=$(echo "$rest" | sed 's/^[^:]*: *//')
+
+        # Provide a generic explanation based on process and message:
+        explanation=""
+        # A few heuristic examples:
+        if echo "$process" | grep -qi 'systemd'; then
+            explanation="<span style='color:#e67e22;font-weight:bold;'>Medium Severity:</span> A system-level service encountered problems. Potential issues include misconfigured unit files, missing dependencies, failed service restarts, or permission conflicts. Use 'journalctl -xe', inspect service configuration files, and verify that required files and directories exist and have correct permissions."
+        elif echo "$process" | grep -qi 'kernel'; then
+            explanation="<span style='color:#c0392b;font-weight:bold;'>High Severity:</span> A low-level kernel issue occurred. This may indicate hardware incompatibilities, driver malfunctions, memory corruption, or unstable kernel modules. Review 'dmesg' for detailed logs, ensure drivers and firmware are up-to-date, test hardware components, and consider rolling back recent kernel updates if instability persists."
+        elif echo "$process" | grep -qi 'bluetoothd'; then
+            explanation="<span style='color:#e67e22;font-weight:bold;'>Medium Severity:</span> A Bluetooth daemon error. Possible causes include pairing failures, missing device firmware, incompatible Bluetooth adapters, or improper Bluetooth stack configuration. Check Bluetooth logs, verify hardware compatibility, ensure the Bluetooth service is running, and update firmware or drivers as needed."
+        elif echo "$process" | grep -qi 'pipewire'; then
+            explanation="<span style='color:#e67e22;font-weight:bold;'>Medium Severity:</span> An audio/media framework issue. Missing codecs, misconfigured audio endpoints, conflicts with ALSA/PulseAudio, or unsupported hardware may cause problems. Inspect PipeWire logs, verify that all dependencies are installed, consider adjusting configuration in '/etc/pipewire/', and ensure no conflicting sound services are active."
+        elif echo "$process" | grep -qi 'fwupd'; then
+            explanation="<span style='color:#e67e22;font-weight:bold;'>Medium Severity:</span> A firmware update utility encountered problems. Common reasons include unavailable firmware, invalid signatures, connectivity issues preventing metadata downloads, or unsupported hardware. Check your internet connection, verify that the correct firmware repository is enabled, and consult 'fwupdmgr get-devices' and 'fwupdmgr get-updates' for more details."
+        elif echo "$process" | grep -qi 'touchegg'; then
+            explanation="<span style='color:#3498db;font-weight:bold;'>Low Severity:</span> A gesture processing tool error. Causes may include unsupported hardware gestures, outdated gesture configuration, or conflicts with the desktop environment’s gesture handling. Review Touchégg’s configuration in '~/.config/touchegg/', update to the latest version, and consult logs to identify unsupported gestures."
+        elif echo "$process" | grep -qi 'cinnamon-screensaver'; then
+            explanation="<span style='color:#3498db;font-weight:bold;'>Low Severity:</span> A screensaver or session locking issue. Potential reasons include failed authentication prompts, graphics driver quirks, or conflicts with power management settings. Check Cinnamon and Xorg logs, ensure correct graphics drivers, and verify that no conflicting screensaver or lock services are running."
+
+        ### Common Desktop & Display Managers
+        elif echo "$process" | grep -qi 'xorg'; then
+            explanation="<span style='color:#e67e22;font-weight:bold;'>Medium Severity:</span> The X server encountered display issues, possibly caused by driver incompatibilities, misconfigured X11 settings, or hardware-related rendering problems. Inspect '/var/log/Xorg.0.log', ensure proper GPU drivers are installed, and review your Xorg configuration files."
+        elif echo "$process" | grep -qi 'gdm'; then
+            explanation="<span style='color:#3498db;font-weight:bold;'>Low Severity:</span> The GNOME Display Manager had trouble initializing. This may be due to incorrect display configuration, a missing greeter theme, or conflicts with other display managers. Check GDM logs in '/var/log/gdm/', ensure GNOME components are installed, and try temporarily switching to a different display manager."
+        elif echo "$process" | grep -qi 'lightdm'; then
+            explanation="<span style='color:#3498db;font-weight:bold;'>Low Severity:</span> LightDM display manager issues may indicate a bad greeter configuration, missing session files, or incorrect permissions on X-related sockets. Review '/var/log/lightdm/', confirm that greeter sessions are correctly installed, and ensure the system’s graphics stack is functioning."
+
+        ### Network & Connectivity
+        elif echo "$process" | grep -qi 'NetworkManager'; then
+            explanation="<span style='color:#e67e22;font-weight:bold;'>Medium Severity:</span> A network configuration daemon issue. Possible causes include failed DHCP negotiations, invalid DNS settings, dropped Wi-Fi connections, or VLAN/multiple-interface misconfigurations. Check '/var/log/syslog', verify network configuration files, and ensure required firmware or drivers for network interfaces."
+        elif echo "$process" | grep -qi 'wpa_supplicant'; then
+            explanation="<span style='color:#e67e22;font-weight:bold;'>Medium Severity:</span> Wi-Fi authentication or connection issue. Incorrect passphrases, EAP configuration errors, or interference can cause failures. Examine '/var/log/syslog' or wpa_supplicant logs, verify that wireless credentials are correct, and ensure no conflicting network management tools are running."
+        elif echo "$process" | grep -qi 'dnsmasq'; then
+            explanation="<span style='color:#3498db;font-weight:bold;'>Low Severity:</span> A lightweight DNS/DHCP service encountered issues. Possibly misconfigured DNS options, overlapping DHCP ranges, or port binding conflicts. Check '/var/log/syslog', verify dnsmasq configuration in '/etc/dnsmasq.conf', and ensure no other services are occupying required ports."
+
+        ### Web & Application Servers
+        elif echo "$process" | grep -qi 'nginx'; then
+            explanation="<span style='color:#e67e22;font-weight:bold;'>Medium Severity:</span> A web server error. Causes include invalid server blocks, conflicting ports, missing SSL certificates, or heavy load causing timeouts. Review '/var/log/nginx/error.log', validate configuration using 'nginx -t', and ensure upstream services or backends are reachable."
+        elif echo "$process" | grep -qi 'apache'; then
+            explanation="<span style='color:#e67e22;font-weight:bold;'>Medium Severity:</span> Apache HTTP server problems. Common issues: syntax errors in .conf files, missing modules, permission blocks on DocumentRoot, or misconfigured virtual hosts. Check '/var/log/apache2/error.log', run 'apachectl configtest', and confirm file permissions and SELinux/AppArmor profiles if applicable."
+
+        ### Databases
+        elif echo "$process" | grep -qi 'mysql\|mariadb'; then
+            explanation="<span style='color:#c0392b;font-weight:bold;'>High Severity:</span> A MySQL/MariaDB database error. This may involve corrupted tables, authentication failures, insufficient disk space, or incorrect server configurations. Inspect '/var/log/mysql/error.log', verify database permissions, and consider running 'mysqlcheck' or restoring from backups if corruption is suspected."
+        elif echo "$process" | grep -qi 'postgres'; then
+            explanation="<span style='color:#c0392b;font-weight:bold;'>High Severity:</span> A PostgreSQL server issue. Potential causes: invalid HBA configuration, missing roles/databases, corrupted indexes, or insufficient resources. Check '/var/log/postgresql/postgresql.log', review pg_hba.conf, ensure adequate memory and disk space, and run integrity checks on databases."
+
+        ### Security & Firewall
+        elif echo "$process" | grep -qi 'fail2ban'; then
+            explanation="<span style='color:#3498db;font-weight:bold;'>Low Severity:</span> Fail2ban encountered a filtering or banning error. Maybe a misconfigured jail, missing log files, or corrupted rules. Verify '/etc/fail2ban/jail.local', ensure log paths are correct, and run 'fail2ban-client status' to check active jails."
+        elif echo "$process" | grep -qi 'auditd'; then
+            explanation="<span style='color:#e67e22;font-weight:bold;'>Medium Severity:</span> An audit subsystem issue. Possibly rules failing to load, insufficient disk space for logs, or overly restrictive filters blocking system calls. Check '/var/log/audit/audit.log', review '/etc/audit/audit.rules', and adjust settings for performance or correctness."
+        elif echo "$process" | grep -qi 'firewalld'; then
+            explanation="<span style='color:#3498db;font-weight:bold;'>Low Severity:</span> A firewall daemon problem. Could be invalid zone definitions, missing firewall modules, or conflicts with another firewall tool. Check 'journalctl -u firewalld', verify '/etc/firewalld/' configuration, and ensure nftables or iptables are supported."
+
+        ### Virtualization & Containers
+        elif echo "$process" | grep -qi 'docker'; then
+            explanation="<span style='color:#e67e22;font-weight:bold;'>Medium Severity:</span> A container runtime issue. Causes: corrupted images, networking misconfigurations, failed container starts due to resource limits, or permission issues with Docker’s socket. Examine 'docker logs' for affected containers, check '/var/log/syslog', and ensure the Docker daemon is running with proper privileges."
+        elif echo "$process" | grep -qi 'containerd'; then
+            explanation="<span style='color:#e67e22;font-weight:bold;'>Medium Severity:</span> Container runtime (containerd) problems. Possibly caused by damaged container images, storage driver issues, or conflicts with other runtimes. Check containerd logs, verify that the containerd service is running, and ensure underlying CNI network configurations are valid."
+        elif echo "$process" | grep -qi 'libvirtd'; then
+            explanation="<span style='color:#e67e22;font-weight:bold;'>Medium Severity:</span> A virtualization daemon error. May involve invalid VM definitions, missing kernel modules (e.g., kvm), or insufficient permissions to access virtualization resources. Check '/var/log/libvirt/', ensure required virtualization extensions are enabled in BIOS, and verify network bridging or storage pools."
+
+        ### Printing & Hardware
+        elif echo "$process" | grep -qi 'cupsd'; then
+            explanation="<span style='color:#3498db;font-weight:bold;'>Low Severity:</span> Printing subsystem (CUPS) encountered a problem. Common causes: missing printer drivers, invalid printer URIs, or permission errors on spool directories. Review '/var/log/cups/error_log', verify printer configuration in '/etc/cups/printers.conf', and ensure the printer is online and accessible."
+        elif echo "$process" | grep -qi 'udev'; then
+            explanation="<span style='color:#e67e22;font-weight:bold;'>Medium Severity:</span> A device manager (udev) rule issue. Possibly malformed rules, missing firmware, or unsupported hardware events. Examine 'journalctl -u systemd-udevd', verify that custom udev rules are correct in '/etc/udev/rules.d/', and ensure the necessary firmware files are present."
+
+        ### Package & Update Management
+        elif echo "$process" | grep -qi 'apt'; then
+            explanation="<span style='color:#3498db;font-weight:bold;'>Low Severity:</span> A package manager (apt) error. Causes could be unreachable repositories, malformed sources.list entries, expired keys, or partial package installations. Check '/var/log/apt/', run 'apt update', verify repository URLs in '/etc/apt/sources.list', and reattempt upgrades after fixing configuration issues."
+        elif echo "$process" | grep -qi 'dnf\|yum'; then
+            explanation="<span style='color:#3498db;font-weight:bold;'>Low Severity:</span> A package manager (DNF/Yum) encountered issues. Potential reasons: broken dependencies, unavailable repos, GPG key problems, or locked database. Check '/var/log/dnf.log' or '/var/log/yum.log', verify '/etc/yum.repos.d/' files, and ensure network connectivity to repositories."
+        elif echo "$process" | grep -qi 'zypper'; then
+            explanation="<span style='color:#3498db;font-weight:bold;'>Low Severity:</span> Zypper package manager error. Possibly invalid repository definitions, network errors, or locked package databases. Inspect '/var/log/zypper.log', run 'zypper refresh', and ensure that repo URLs and keys are correct."
+
+        ### Miscellaneous & General
+        elif echo "$process" | grep -qi 'cron'; then
+            explanation="<span style='color:#3498db;font-weight:bold;'>Low Severity:</span> A scheduled task (cron) issue. A script may have a syntax error, missing environment variables, or insufficient permissions. Check syslog for cron messages, verify that scripts are executable and have proper #! lines, and confirm that expected environment variables are set."
+        elif echo "$process" | grep -qi 'rsyslog'; then
+            explanation="<span style='color:#3498db;font-weight:bold;'>Low Severity:</span> A system log daemon issue. Misconfigured logging rules, invalid output destinations, or permission errors on log files can cause problems. Inspect '/etc/rsyslog.conf', verify that log directories exist and have correct permissions, and run 'rsyslogd -N1' to check configuration."
+        elif echo "$process" | grep -qi 'logrotate'; then
+            explanation="<span style='color:#3498db;font-weight:bold;'>Low Severity:</span> A log rotation issue. Possibly malformed rotation rules, missing directories, or insufficient permissions to rotate logs. Check '/etc/logrotate.conf' and files in '/etc/logrotate.d/', verify ownership of log directories, and attempt 'logrotate -d' to dry-run the configuration."
+        elif echo "$process" | grep -qi 'journalctl'; then
+            explanation="<span style='color:#3498db;font-weight:bold;'>Low Severity:</span> An issue reading or managing the systemd journal. The journal may be corrupted, permissions wrong, or disk space too low. Run 'journalctl --verify', ensure '/var/log/journal/' is writable by systemd-journald, and consider clearing or archiving old logs."
+
+        else
+            explanation="<span style='color:#3498db;font-weight:bold;'>Low Severity (Unknown Process):</span> A general or unrecognized process error. This may involve resource limitations, unexpected runtime conditions, configuration mistakes, or third-party applications. Examine this application’s logs in detail, review its configuration files, and consult official documentation or support forums for troubleshooting guidance."
+        fi
+
+
+        echo "<tr>"
+        echo "<td>$local_user_time</td>"
+        echo "<td>$host</td>"
+        echo "<td>$process</td>"
+        echo "<td><pre style='white-space: pre-wrap;'>$message</pre></td>"
+        echo "<td>$explanation</td>"
+        echo "</tr>"
+    done
+
+    echo "</table>"
+}
+
+generate_disk_usage_html() {
+    echo "<table class='usage-table'>"
+    echo "<tr><th>Filesystem</th><th>Size</th><th>Used</th><th>Avail</th><th>Use%</th><th>Mounted on</th></tr>"
+    tail -n +2 "$TEMP_DIR/disk_usage.txt" | while read -r fs size used avail usep mount; do
+        percent="${usep%\%}"
+        echo "<tr>"
+        echo "<td>$fs</td><td>$size</td><td>$used</td><td>$avail</td>"
+        echo "<td><div class='bar'><div class='bar-fill' style='width:${percent}%'></div><span>${usep}</span></div></td>"
+        echo "<td>$mount</td>"
+        echo "</tr>"
+    done
+    echo "</table>"
+}
+
+generate_memory_usage_html() {
+    mem_line=$(grep -i "Mem:" "$TEMP_DIR/memory_usage.txt" || true)
+    if [ -z "$mem_line" ]; then
+        echo "<p>Memory usage data not available.</p>"
+        return
+    fi
+    total_mem=$(echo "$mem_line" | awk '{print $2}')
+    used_mem=$(echo "$mem_line" | awk '{print $3}')
+
+    # Assume values in G for simplicity
+    total_gb=$(echo "$total_mem" | sed 's/G//I')
+    used_gb=$(echo "$used_mem" | sed 's/G//I')
+
+    usage_percent=$(awk -v u="$used_gb" -v t="$total_gb" 'BEGIN{if(t>0){print (u/t)*100}else{print 0}}')
+
+    echo "<div class='bar-container'>"
+    echo "<p>Total: $total_mem, Used: $used_mem</p>"
+    echo "<div class='bar'><div class='bar-fill' style='width:${usage_percent}%'></div><span>$(printf '%.0f%%' "$usage_percent")</span></div>"
+    echo "</div>"
+}
+
+generate_cpu_load_html() {
+    load_line=$(head -n1 "$TEMP_DIR/cpu_load.txt" || true)
+    load_avg=$(echo "$load_line" | sed -n 's/.*load average: *\([^,]*\),.*/\1/p')
+    if [ -n "$load_avg" ]; then
+        echo "<p>Load Average: $load_avg</p>"
+        load_percent=$(awk -v la="$load_avg" 'BEGIN{if (la>1){la=1}; print la*100}')
+        echo "<div class='bar-container'>"
+        echo "<div class='bar'><div class='bar-fill' style='width:${load_percent}%'></div><span>$(printf '%.0f%%' "$load_percent")</span></div>"
+        echo "</div>"
+    else
+        echo "<p>Could not parse CPU load average.</p>"
+    fi
+}
+
+compile_report() {
+    log "Compiling system health report into HTML..."
+    {
+        echo "<!DOCTYPE html>"
+        echo "<html lang='en'>"
+        echo "<head>"
+        echo "<meta charset='UTF-8'>"
+        echo "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+        echo "<title>System Health Report</title>"
+        echo "<style>"
+        echo "body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 20px; background: #f0f6fc; color: #333; }"
+        echo "h1, h2, h3 { color: #1b4f72; }"
+        echo "details { margin-bottom: 20px; background: #fff; border-radius: 8px; padding: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }"
+        echo "summary { font-size: 1.2em; font-weight: bold; cursor: pointer; color: #1b4f72; }"
+        echo "pre { background: #eaf2f8; padding: 10px; border: 1px solid #ccc; overflow: auto; border-radius: 4px; white-space: pre-wrap; }"
+        echo ".critical { color: red; font-weight: bold; }"
+        echo ".usage-table { width: 100%; border-collapse: collapse; margin-bottom: 10px; }"
+        echo ".usage-table th, .usage-table td { border: 1px solid #ccc; padding: 8px; text-align: left; font-size: 0.9em; }"
+        echo ".usage-table th { background: #d6eaf8; }"
+        echo ".bar-container { margin: 10px 0; }"
+        echo ".bar { position: relative; background: #d6eaf8; border-radius: 4px; overflow: hidden; height: 24px; }"
+        echo ".bar-fill { background: #1b4f72; height: 100%; }"
+        echo ".bar span { position: absolute; right: 10px; top: 2px; font-weight: bold; color: #fff; }"
+        echo ".error-table { width: 100%; border-collapse: collapse; margin-bottom: 10px; }"
+        echo ".error-table th, .error-table td { border: 1px solid #ccc; padding: 8px; text-align: left; font-size: 0.9em; vertical-align: top; }"
+        echo ".error-table th { background: #d6eaf8; }"
+        echo "</style>"
+        echo "</head>"
+        echo "<body>"
+        echo "<h1>System Health Report</h1>"
+        echo "<p>Date (UTC): $(date -u)</p>"
+
+        echo "<details open>"
+        echo "<summary>System Info</summary>"
+        echo "<pre>$(uname -a)</pre>"
+        echo "<p>Uptime: $(uptime -p)</p>"
+        echo "</details>"
+
+        echo "<details>"
+        echo "<summary>Disk Usage</summary>"
+        generate_disk_usage_html
+        echo "</details>"
+
+        echo "<details>"
+        echo "<summary>Memory Usage</summary>"
+        generate_memory_usage_html
+        echo "</details>"
+
+        echo "<details>"
+        echo "<summary>CPU Load</summary>"
+        generate_cpu_load_html
+        echo "<pre>$(cat "$TEMP_DIR/cpu_load.txt")</pre>"
+        echo "</details>"
+
+        echo "<details>"
+        echo "<summary>SMART Disk Status</summary>"
+        cat "$TEMP_DIR/smart_status.html"
+        echo "</details>"
+
+        echo "<details>"
+        echo "<summary>Recent System Errors</summary>"
+        highlight_logs "$TEMP_DIR/system_errors.txt"
+        echo "</details>"
+
+        echo "<details>"
+        echo "<summary>Package Integrity Check (debsums)</summary>"
+        cat "$TEMP_DIR/debsums_report.html"
+        echo "</details>"
+
+        echo "</body>"
+        echo "</html>"
+    } > "$REPORT_FILE"
+
+    # Ensure ownership for the calling user
+    if [ -n "${SUDO_USER:-}" ]; then
+        chown "${SUDO_USER}:${SUDO_USER}" "$REPORT_FILE"
+    fi
+}
+
+# Parse command line arguments
+while (( "$#" )); do
+    case "$1" in
+        -n|--no-update)
+            DO_UPDATE=false
+            shift
+            ;;
+        -s|--skip-smart)
+            DO_SMART=false
+            shift
+            ;;
+        -d|--no-debsums)
+            DO_DEBSUMS=false
+            shift
+            ;;
+        -l|--log-file)
+            LOG_FILE="$2"
+            shift 2
+            ;;
+        -r|--report-file)
+            REPORT_FILE="$2"
+            shift 2
+            ;;
+        -h|--help)
+            print_help
+            exit 0
+            ;;
+        -*|--*=)
+            log "Error: Unsupported flag $1"
+            exit 1
+            ;;
+        *)
+            # Preserve positional arguments if needed
+            shift
+            ;;
+    esac
+done
+
+# Main script execution
+touch "$LOG_FILE" # Ensure log file exists
+check_root
+rm -rf "$TEMP_DIR" && mkdir -p "$TEMP_DIR"
+
+trap 'cleanup' EXIT
+
+log "Starting system maintenance and health check..."
+log "Report will be saved to: $REPORT_FILE"
+log "Logs will be saved to: $LOG_FILE"
+
+system_update
+clean_apt_cache
+check_disk_usage
+check_smart_status
+schedule_filesystem_check
+check_memory_usage
+check_cpu_load
+check_system_logs
+check_and_repair_debsums
+log "Finished package integrity checks, now compiling report..."
+compile_report
+
+log "System maintenance and health check completed."
+log "Report saved to: $REPORT_FILE"
