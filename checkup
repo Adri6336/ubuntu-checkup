@@ -169,6 +169,9 @@ check_system_logs() {
 }
 
 check_and_repair_debsums() {
+    : "${DO_DEBSUMS:=false}"
+    : "${TEMP_DIR:=/tmp}"
+
     if [ "$DO_DEBSUMS" = true ]; then
         log "Checking package integrity with debsums..."
         install_if_missing "debsums" "debsums"
@@ -177,7 +180,10 @@ check_and_repair_debsums() {
 
         if [ -s "$DEBSUMS_ERRORS" ]; then
             log "Found corrupted packages. Attempting to repair..."
-            PACKAGES=$(awk '{print $1}' "$DEBSUMS_ERRORS" | xargs -I{} dpkg -S "{}" 2>/dev/null | cut -d: -f1 | sort -u)
+            PACKAGES=$(awk '{print $1}' "$DEBSUMS_ERRORS" | \
+                       xargs -r -I{} sh -c 'dpkg -S "$1" 2>/dev/null || true' _ {} | \
+                       cut -d: -f1 | sort -u)
+
             if [ -n "$PACKAGES" ]; then
                 log "Packages to reinstall: $PACKAGES"
                 apt-get install --reinstall -y $PACKAGES
@@ -188,10 +194,10 @@ check_and_repair_debsums() {
             log "No package integrity issues found."
         fi
 
-        # Convert debsums output to HTML
+        # Convert debsums output to HTML, allowing debsums to fail without halting the script
         {
             echo "<pre>"
-            debsums
+            debsums || true
             echo "</pre>"
         } > "$TEMP_DIR/debsums_report.html"
     else
